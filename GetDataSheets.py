@@ -168,6 +168,8 @@ def build_queries(brand: str, code: str, description: str) -> list[str]:
     if description:
         bits.append(description)
     base = " ".join(bits)
+    quoted_code = f"\"{code}\"" if code else ""
+    quoted_brand = f"\"{brand}\"" if brand else ""
     return [
         f"{base} datasheet filetype:pdf",
         f"{base} datasheet pdf",
@@ -180,7 +182,76 @@ def build_queries(brand: str, code: str, description: str) -> list[str]:
         f"{base} technical datasheet",
         f"{base} spec sheet",
         f"{base} technical specifications",
+        f"{quoted_brand} {quoted_code} datasheet pdf".strip(),
+        f"{quoted_brand} {quoted_code} data sheet pdf".strip(),
+        f"{quoted_brand} {quoted_code} spec sheet pdf".strip(),
     ]
+
+
+def normalize_match_text(text: str) -> str:
+    return re.sub(r"[^a-z0-9]+", " ", text.lower())
+
+
+def text_contains_token(text: str, token: str) -> bool:
+    if not text or not token:
+        return False
+    return normalize_match_text(token).strip() in normalize_match_text(text)
+
+
+def score_candidate(
+    url: str,
+    title: str,
+    body: str,
+    brand: str,
+    code: str,
+    description: str,
+) -> int:
+    text = " ".join([url or "", title or "", body or ""])
+    score = 0
+    if looks_like_pdf_url(url):
+        score += 5
+    for keyword in ("datasheet", "data sheet", "spec sheet", "technical datasheet"):
+        if keyword in text.lower():
+            score += 4
+            break
+    if text_contains_token(text, code):
+        score += 6
+    if text_contains_token(text, brand):
+        score += 3
+    if description and text_contains_token(text, description):
+        score += 1
+
+    negative_keywords = (
+        "manual",
+        "installation",
+        "brochure",
+        "catalog",
+        "safety data sheet",
+        "sds",
+        "msds",
+        "drawing",
+        "cad",
+        "certificate",
+        "guide",
+        "handbook",
+        "user manual",
+    )
+    for keyword in negative_keywords:
+        if keyword in text.lower():
+            score -= 4
+            break
+    return score
+
+
+def filter_pdf_links(
+    pdf_links: list[str], brand: str, code: str, description: str
+) -> list[str]:
+    scored: list[tuple[int, str]] = []
+    for link in pdf_links:
+        score = score_candidate(link, "", "", brand, code, description)
+        scored.append((score, link))
+    scored.sort(key=lambda item: item[0], reverse=True)
+    return [link for _, link in scored]
 
 
 def extract_pdf_links_from_html(html: str, base_url: str) -> list[str]:
@@ -201,7 +272,9 @@ def extract_pdf_links_from_html(html: str, base_url: str) -> list[str]:
     return deduped
 
 
-def find_best_pdf_links(queries: list[str]) -> list[str]:
+def find_best_pdf_links(
+    queries: list[str], brand: str, code: str, description: str
+) -> list[str]:
     """
     Returns a list of candidate URLs (best-first) from DuckDuckGo results.
     """
@@ -209,21 +282,24 @@ def find_best_pdf_links(queries: list[str]) -> list[str]:
         raise RuntimeError(
             "Search dependency missing. Install 'ddgs' (preferred) or 'duckduckgo_search'."
         )
-    urls: list[str] = []
+    results: list[tuple[int, str]] = []
     with DDGS() as ddgs:
         for query in queries:
             for r in ddgs.text(query, max_results=SEARCH_RESULTS_PER_ITEM):
                 u = r.get("href") or r.get("url")
-                if u:
-                    urls.append(u)
+                if not u:
+                    continue
+                title = r.get("title") or ""
+                body = r.get("body") or ""
+                score = score_candidate(u, title, body, brand, code, description)
+                results.append((score, u))
 
-    # Prefer direct PDFs first, then anything else (we'll content-type check)
-    urls.sort(key=lambda u: 0 if looks_like_pdf_url(u) else 1)
+    results.sort(key=lambda item: (item[0], 1 if looks_like_pdf_url(item[1]) else 0), reverse=True)
 
     # De-dupe while preserving order
     seen = set()
     deduped = []
-    for u in urls:
+    for _, u in results:
         if u not in seen:
             seen.add(u)
             deduped.append(u)
@@ -293,7 +369,7 @@ def main():
         print(f"[{idx+1}/{total}] Searching: {queries[0]}")
 
         try:
-            candidates = find_best_pdf_links(queries)
+            candidates = find_best_pdf_links(queries, brand, code, description)
         except Exception as e:
             failed += 1
             print(f"  FAIL search: {e}")
@@ -315,6 +391,7 @@ def main():
                 r = sess.get(url, allow_redirects=True, timeout=REQUEST_TIMEOUT)
                 if r.ok and "text/html" in (r.headers.get("Content-Type") or "").lower():
                     pdf_links = extract_pdf_links_from_html(r.text, r.url)
+                    pdf_links = filter_pdf_links(pdf_links, brand, code, description)
                     for pdf_url in pdf_links:
                         print(f"  Trying: {pdf_url}")
                         if download_pdf(sess, pdf_url, out_path):
