@@ -3,7 +3,7 @@ import re
 import time
 import random
 import hashlib
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urljoin
 
 import pandas as pd
 import requests
@@ -29,7 +29,7 @@ OUTPUT_DIR = "data sheets"            # where PDFs will be saved
 # If you know your sheet name, set it like: SHEET_NAME = "Products"
 SHEET_NAME = 0                        # 0 = first sheet, or use a string sheet name e.g. "Products"
 
-SEARCH_RESULTS_PER_ITEM = 8           # how many results to consider per product
+SEARCH_RESULTS_PER_ITEM = 15          # how many results to consider per product
 REQUEST_TIMEOUT = 30
 SLEEP_BETWEEN_PRODUCTS_SEC = (1.0, 2.5)  # random sleep range between products
 USER_AGENT = (
@@ -161,8 +161,34 @@ def build_queries(brand: str, code: str) -> list[str]:
     return [
         f"{base} datasheet filetype:pdf",
         f"{base} datasheet pdf",
+        f"{base} technical datasheet pdf",
+        f"{base} technical data sheet pdf",
+        f"{base} spec sheet pdf",
+        f"{base} product data sheet pdf",
+        f"{base} specifications pdf",
         f"{base} datasheet",
+        f"{base} technical datasheet",
+        f"{base} spec sheet",
+        f"{base} technical specifications",
     ]
+
+
+def extract_pdf_links_from_html(html: str, base_url: str) -> list[str]:
+    """
+    Extract PDF links from an HTML page.
+    """
+    links = re.findall(r'href=["\']([^"\']+\.pdf[^"\']*)["\']', html, re.IGNORECASE)
+    resolved = []
+    for link in links:
+        resolved.append(urljoin(base_url, link))
+    # De-dupe while preserving order
+    seen = set()
+    deduped = []
+    for link in resolved:
+        if link not in seen:
+            seen.add(link)
+            deduped.append(link)
+    return deduped
 
 
 def find_best_pdf_links(queries: list[str]) -> list[str]:
@@ -260,15 +286,30 @@ def main():
         downloaded = False
         for url in candidates:
             is_pdf = looks_like_pdf_url(url) or head_or_get_is_pdf(sess, url)
-            if not is_pdf:
+            if is_pdf:
+                print(f"  Trying: {url}")
+                if download_pdf(sess, url, out_path):
+                    ok += 1
+                    downloaded = True
+                    print(f"  OK -> {out_path}")
+                    break
                 continue
 
-            print(f"  Trying: {url}")
-            if download_pdf(sess, url, out_path):
-                ok += 1
-                downloaded = True
-                print(f"  OK -> {out_path}")
-                break
+            try:
+                r = sess.get(url, allow_redirects=True, timeout=REQUEST_TIMEOUT)
+                if r.ok and "text/html" in (r.headers.get("Content-Type") or "").lower():
+                    pdf_links = extract_pdf_links_from_html(r.text, r.url)
+                    for pdf_url in pdf_links:
+                        print(f"  Trying: {pdf_url}")
+                        if download_pdf(sess, pdf_url, out_path):
+                            ok += 1
+                            downloaded = True
+                            print(f"  OK -> {out_path}")
+                            break
+                if downloaded:
+                    break
+            except Exception:
+                continue
 
         if not downloaded:
             failed += 1
