@@ -7,7 +7,14 @@ from urllib.parse import urlparse
 
 import pandas as pd
 import requests
-from duckduckgo_search import DDGS
+
+try:
+    from ddgs import DDGS  # renamed package
+except ImportError:  # pragma: no cover - fallback when ddgs isn't installed
+    try:
+        from duckduckgo_search import DDGS  # type: ignore
+    except ImportError:  # pragma: no cover
+        DDGS = None
 
 
 # =========================
@@ -142,28 +149,37 @@ def download_pdf(sess: requests.Session, url: str, out_path: str) -> bool:
         return False
 
 
-def build_query(brand: str, code: str) -> str:
+def build_queries(brand: str, code: str) -> list[str]:
     """
-    Query tuned to pull datasheets, not shopping pages.
+    Queries tuned to pull datasheets, not shopping pages.
     """
     bits = []
     if brand:
         bits.append(brand)
     bits.append(code)
-    bits.append("datasheet filetype:pdf")
-    return " ".join(bits)
+    base = " ".join(bits)
+    return [
+        f"{base} datasheet filetype:pdf",
+        f"{base} datasheet pdf",
+        f"{base} datasheet",
+    ]
 
 
-def find_best_pdf_links(query: str) -> list[str]:
+def find_best_pdf_links(queries: list[str]) -> list[str]:
     """
     Returns a list of candidate URLs (best-first) from DuckDuckGo results.
     """
+    if DDGS is None:
+        raise RuntimeError(
+            "Search dependency missing. Install 'ddgs' (preferred) or 'duckduckgo_search'."
+        )
     urls: list[str] = []
     with DDGS() as ddgs:
-        for r in ddgs.text(query, max_results=SEARCH_RESULTS_PER_ITEM):
-            u = r.get("href") or r.get("url")
-            if u:
-                urls.append(u)
+        for query in queries:
+            for r in ddgs.text(query, max_results=SEARCH_RESULTS_PER_ITEM):
+                u = r.get("href") or r.get("url")
+                if u:
+                    urls.append(u)
 
     # Prefer direct PDFs first, then anything else (we'll content-type check)
     urls.sort(key=lambda u: 0 if looks_like_pdf_url(u) else 1)
@@ -231,11 +247,11 @@ def main():
             print(f"[{idx+1}/{total}] SKIP: already exists -> {filename}")
             continue
 
-        query = build_query(brand, code)
-        print(f"[{idx+1}/{total}] Searching: {query}")
+        queries = build_queries(brand, code)
+        print(f"[{idx+1}/{total}] Searching: {queries[0]}")
 
         try:
-            candidates = find_best_pdf_links(query)
+            candidates = find_best_pdf_links(queries)
         except Exception as e:
             failed += 1
             print(f"  FAIL search: {e}")
