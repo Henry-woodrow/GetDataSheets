@@ -7,14 +7,21 @@ from urllib.parse import urlparse
 
 import pandas as pd
 import requests
-from duckduckgo_search import DDGS
+
+try:
+    from ddgs import DDGS  # renamed package
+except ImportError:  # pragma: no cover - fallback when ddgs isn't installed
+    try:
+        from duckduckgo_search import DDGS  # type: ignore
+    except ImportError:  # pragma: no cover
+        DDGS = None
 
 
 # =========================
 # CONFIG
 # =========================
 EXCEL_PATH = "products.xlsx"          # input Excel file path
-OUTPUT_DIR = "datasheets"             # where PDFs will be saved
+OUTPUT_DIR = "data sheets"            # where PDFs will be saved
 
 # IMPORTANT FIX:
 # If SHEET_NAME is None, pandas returns a dict of DataFrames (one per sheet).
@@ -49,6 +56,28 @@ def safe_filename(name: str, max_len: int = 150) -> str:
         h = hashlib.sha1(name.encode("utf-8")).hexdigest()[:8]
         name = name[: max_len - 9] + "_" + h
     return name
+
+
+def normalize_column_name(name: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "", str(name).strip().lower())
+
+
+def resolve_column(df: pd.DataFrame, candidates: set[str]) -> str:
+    normalized = {normalize_column_name(col): col for col in df.columns}
+    for candidate in candidates:
+        if candidate in normalized:
+            return normalized[candidate]
+    raise ValueError(
+        "Excel must contain columns for Brand and ProductCode "
+        f"(searched for {sorted(candidates)})."
+    )
+
+
+def build_output_filename(brand: str, code: str) -> str:
+    parts = [code.strip()]
+    if brand and brand.strip():
+        parts.append(brand.strip())
+    return safe_filename(" ".join(parts)) + ".pdf"
 
 
 def looks_like_pdf_url(url: str) -> bool:
@@ -120,28 +149,37 @@ def download_pdf(sess: requests.Session, url: str, out_path: str) -> bool:
         return False
 
 
-def build_query(brand: str, code: str) -> str:
+def build_queries(brand: str, code: str) -> list[str]:
     """
-    Query tuned to pull datasheets, not shopping pages.
+    Queries tuned to pull datasheets, not shopping pages.
     """
     bits = []
     if brand:
         bits.append(brand)
     bits.append(code)
-    bits.append("datasheet filetype:pdf")
-    return " ".join(bits)
+    base = " ".join(bits)
+    return [
+        f"{base} datasheet filetype:pdf",
+        f"{base} datasheet pdf",
+        f"{base} datasheet",
+    ]
 
 
-def find_best_pdf_links(query: str) -> list[str]:
+def find_best_pdf_links(queries: list[str]) -> list[str]:
     """
     Returns a list of candidate URLs (best-first) from DuckDuckGo results.
     """
+    if DDGS is None:
+        raise RuntimeError(
+            "Search dependency missing. Install 'ddgs' (preferred) or 'duckduckgo_search'."
+        )
     urls: list[str] = []
     with DDGS() as ddgs:
-        for r in ddgs.text(query, max_results=SEARCH_RESULTS_PER_ITEM):
-            u = r.get("href") or r.get("url")
-            if u:
-                urls.append(u)
+        for query in queries:
+            for r in ddgs.text(query, max_results=SEARCH_RESULTS_PER_ITEM):
+                u = r.get("href") or r.get("url")
+                if u:
+                    urls.append(u)
 
     # Prefer direct PDFs first, then anything else (we'll content-type check)
     urls.sort(key=lambda u: 0 if looks_like_pdf_url(u) else 1)
@@ -181,8 +219,8 @@ def load_products_excel(path: str, sheet_name):
 def main():
     df = load_products_excel(EXCEL_PATH, SHEET_NAME)
 
-    if "Brand" not in df.columns or "ProductCode" not in df.columns:
-        raise ValueError("Excel must contain columns: 'Brand' and 'ProductCode'")
+    brand_col = resolve_column(df, {"brand", "brandname"})
+    code_col = resolve_column(df, {"productcode", "productid", "productnumber"})
 
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     sess = request_session()
@@ -193,15 +231,15 @@ def main():
     failed = 0
 
     for idx, row in df.iterrows():
-        brand = str(row.get("Brand") or "").strip()
-        code = str(row.get("ProductCode") or "").strip()
+        brand = str(row.get(brand_col) or "").strip()
+        code = str(row.get(code_col) or "").strip()
 
         if not code:
             skipped += 1
             print(f"[{idx+1}/{total}] SKIP: empty ProductCode")
             continue
 
-        filename = safe_filename(code) + ".pdf"
+        filename = build_output_filename(brand, code)
         out_path = os.path.join(OUTPUT_DIR, filename)
 
         if os.path.exists(out_path) and os.path.getsize(out_path) > 10_000:
@@ -209,11 +247,11 @@ def main():
             print(f"[{idx+1}/{total}] SKIP: already exists -> {filename}")
             continue
 
-        query = build_query(brand, code)
-        print(f"[{idx+1}/{total}] Searching: {query}")
+        queries = build_queries(brand, code)
+        print(f"[{idx+1}/{total}] Searching: {queries[0]}")
 
         try:
-            candidates = find_best_pdf_links(query)
+            candidates = find_best_pdf_links(queries)
         except Exception as e:
             failed += 1
             print(f"  FAIL search: {e}")
