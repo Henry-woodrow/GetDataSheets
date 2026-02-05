@@ -7,6 +7,8 @@ from urllib.parse import urlparse, urljoin
 
 import pandas as pd
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 try:
     from ddgs import DDGS  # renamed package
@@ -30,7 +32,9 @@ OUTPUT_DIR = "data sheets"            # where PDFs will be saved
 SHEET_NAME = 0                        # 0 = first sheet, or use a string sheet name e.g. "Products"
 
 SEARCH_RESULTS_PER_ITEM = 15          # how many results to consider per product
-REQUEST_TIMEOUT = 30
+REQUEST_TIMEOUT = (10, 60)  # (connect, read) seconds
+RETRY_TOTAL = 4
+RETRY_BACKOFF = 0.6
 SLEEP_BETWEEN_PRODUCTS_SEC = (1.0, 2.5)  # random sleep range between products
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -99,6 +103,18 @@ def looks_like_pdf_url(url: str) -> bool:
 def request_session() -> requests.Session:
     s = requests.Session()
     s.headers.update({"User-Agent": USER_AGENT})
+    retry = Retry(
+        total=RETRY_TOTAL,
+        connect=RETRY_TOTAL,
+        read=RETRY_TOTAL,
+        backoff_factor=RETRY_BACKOFF,
+        status_forcelist=(429, 500, 502, 503, 504, 522, 524),
+        allowed_methods=("HEAD", "GET"),
+        raise_on_status=False,
+    )
+    adapter = HTTPAdapter(max_retries=retry)
+    s.mount("http://", adapter)
+    s.mount("https://", adapter)
     return s
 
 
@@ -285,14 +301,18 @@ def find_best_pdf_links(
     results: list[tuple[int, str]] = []
     with DDGS() as ddgs:
         for query in queries:
-            for r in ddgs.text(query, max_results=SEARCH_RESULTS_PER_ITEM):
-                u = r.get("href") or r.get("url")
-                if not u:
-                    continue
-                title = r.get("title") or ""
-                body = r.get("body") or ""
-                score = score_candidate(u, title, body, brand, code, description)
-                results.append((score, u))
+            try:
+                for r in ddgs.text(query, max_results=SEARCH_RESULTS_PER_ITEM):
+                    u = r.get("href") or r.get("url")
+                    if not u:
+                        continue
+                    title = r.get("title") or ""
+                    body = r.get("body") or ""
+                    score = score_candidate(u, title, body, brand, code, description)
+                    results.append((score, u))
+            except Exception as exc:
+                print(f"  WARN search timeout for query '{query}': {exc}")
+                continue
 
     results.sort(key=lambda item: (item[0], 1 if looks_like_pdf_url(item[1]) else 0), reverse=True)
 
