@@ -73,6 +73,14 @@ def resolve_column(df: pd.DataFrame, candidates: set[str]) -> str:
     )
 
 
+def resolve_optional_column(df: pd.DataFrame, candidates: set[str]) -> str | None:
+    normalized = {normalize_column_name(col): col for col in df.columns}
+    for candidate in candidates:
+        if candidate in normalized:
+            return normalized[candidate]
+    return None
+
+
 def build_output_filename(brand: str, code: str) -> str:
     parts = [code.strip()]
     if brand and brand.strip():
@@ -149,7 +157,7 @@ def download_pdf(sess: requests.Session, url: str, out_path: str) -> bool:
         return False
 
 
-def build_queries(brand: str, code: str) -> list[str]:
+def build_queries(brand: str, code: str, description: str) -> list[str]:
     """
     Queries tuned to pull datasheets, not shopping pages.
     """
@@ -157,6 +165,8 @@ def build_queries(brand: str, code: str) -> list[str]:
     if brand:
         bits.append(brand)
     bits.append(code)
+    if description:
+        bits.append(description)
     base = " ".join(bits)
     return [
         f"{base} datasheet filetype:pdf",
@@ -247,6 +257,9 @@ def main():
 
     brand_col = resolve_column(df, {"brand", "brandname"})
     code_col = resolve_column(df, {"productcode", "productid", "productnumber"})
+    description_col = resolve_optional_column(
+        df, {"description", "productdescription", "details", "notes"}
+    )
 
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     sess = request_session()
@@ -259,6 +272,9 @@ def main():
     for idx, row in df.iterrows():
         brand = str(row.get(brand_col) or "").strip()
         code = str(row.get(code_col) or "").strip()
+        description = ""
+        if description_col:
+            description = str(row.get(description_col) or "").strip()
 
         if not code:
             skipped += 1
@@ -273,7 +289,7 @@ def main():
             print(f"[{idx+1}/{total}] SKIP: already exists -> {filename}")
             continue
 
-        queries = build_queries(brand, code)
+        queries = build_queries(brand, code, description)
         print(f"[{idx+1}/{total}] Searching: {queries[0]}")
 
         try:
