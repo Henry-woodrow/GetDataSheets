@@ -3,6 +3,9 @@ import re
 import time
 import random
 import hashlib
+import json
+from datetime import datetime
+import textwrap
 from urllib.parse import urlparse, urljoin
 
 import pandas as pd
@@ -288,17 +291,21 @@ def extract_pdf_links_from_html(html: str, base_url: str) -> list[str]:
     return deduped
 
 
+def normalize_whitespace(text: str) -> str:
+    return re.sub(r"\s+", " ", text or "").strip()
+
+
 def find_best_pdf_links(
     queries: list[str], brand: str, code: str, description: str
-) -> list[str]:
+) -> list[dict]:
     """
-    Returns a list of candidate URLs (best-first) from DuckDuckGo results.
+    Returns a list of candidate metadata dicts (best-first) from DuckDuckGo results.
     """
     if DDGS is None:
         raise RuntimeError(
             "Search dependency missing. Install 'ddgs' (preferred) or 'duckduckgo_search'."
         )
-    results: list[tuple[int, str]] = []
+    results: list[dict] = []
     with DDGS() as ddgs:
         for query in queries:
             try:
@@ -309,21 +316,199 @@ def find_best_pdf_links(
                     title = r.get("title") or ""
                     body = r.get("body") or ""
                     score = score_candidate(u, title, body, brand, code, description)
-                    results.append((score, u))
+                    results.append(
+                        {
+                            "score": score,
+                            "url": u,
+                            "title": normalize_whitespace(title),
+                            "body": normalize_whitespace(body),
+                        }
+                    )
             except Exception as exc:
                 print(f"  WARN search timeout for query '{query}': {exc}")
                 continue
 
-    results.sort(key=lambda item: (item[0], 1 if looks_like_pdf_url(item[1]) else 0), reverse=True)
+    results.sort(
+        key=lambda item: (item["score"], 1 if looks_like_pdf_url(item["url"]) else 0),
+        reverse=True,
+    )
 
     # De-dupe while preserving order
     seen = set()
-    deduped = []
-    for _, u in results:
-        if u not in seen:
-            seen.add(u)
-            deduped.append(u)
+    deduped: list[dict] = []
+    for item in results:
+        if item["url"] not in seen:
+            seen.add(item["url"])
+            deduped.append(item)
     return deduped
+
+
+def openai_api_key() -> str | None:
+    key = os.getenv("OPENAI_API_KEY", "").strip()
+    return key or None
+
+
+def parse_json_response(text: str) -> dict | None:
+    if not text:
+        return None
+    cleaned = text.strip()
+    if cleaned.startswith("```"):
+        cleaned = re.sub(r"^```[a-zA-Z0-9]*\n?", "", cleaned)
+        cleaned = cleaned.rstrip("`").strip()
+    try:
+        return json.loads(cleaned)
+    except json.JSONDecodeError:
+        return None
+
+
+def ai_rank_candidates(
+    candidates: list[dict], brand: str, code: str, description: str
+) -> list[dict]:
+    api_key = openai_api_key()
+    if not api_key or not candidates:
+        return candidates
+
+    model = os.getenv("OPENAI_MODEL", "gpt-4o-mini").strip() or "gpt-4o-mini"
+    api_url = os.getenv("OPENAI_API_URL", "https://api.openai.com/v1/chat/completions").strip()
+
+    top_candidates = candidates[:10]
+    payload_items = [
+        {
+            "index": idx,
+            "url": item["url"],
+            "title": item.get("title", ""),
+            "snippet": item.get("body", ""),
+        }
+        for idx, item in enumerate(top_candidates)
+    ]
+
+    prompt = (
+        "You are ranking candidate URLs for a product datasheet PDF. "
+        "Pick the best match for the given product. "
+        "Return JSON only with keys best_index (int or null) and ranked_indexes (array of ints)."
+    )
+    user_payload = {
+        "brand": brand,
+        "product_code": code,
+        "description": description,
+        "candidates": payload_items,
+    }
+
+    try:
+        response = requests.post(
+            api_url,
+            headers={"Authorization": f"Bearer {api_key}"},
+            json={
+                "model": model,
+                "messages": [
+                    {"role": "system", "content": prompt},
+                    {"role": "user", "content": json.dumps(user_payload)},
+                ],
+                "temperature": 0.1,
+            },
+            timeout=REQUEST_TIMEOUT,
+        )
+        response.raise_for_status()
+    except Exception as exc:
+        print(f"  WARN AI ranking failed: {exc}")
+        return candidates
+
+    data = response.json()
+    content = (
+        data.get("choices", [{}])[0]
+        .get("message", {})
+        .get("content", "")
+    )
+    parsed = parse_json_response(content)
+    if not parsed:
+        return candidates
+
+    ranked_indexes = parsed.get("ranked_indexes")
+    if isinstance(ranked_indexes, list) and all(isinstance(i, int) for i in ranked_indexes):
+        ordered = []
+        used = set()
+        for idx in ranked_indexes:
+            if 0 <= idx < len(top_candidates) and idx not in used:
+                ordered.append(top_candidates[idx])
+                used.add(idx)
+        for idx, item in enumerate(top_candidates):
+            if idx not in used:
+                ordered.append(item)
+        ordered.extend(candidates[len(top_candidates):])
+        return ordered
+
+    best_index = parsed.get("best_index")
+    if isinstance(best_index, int) and 0 <= best_index < len(top_candidates):
+        best = top_candidates[best_index]
+        remaining = [c for idx, c in enumerate(top_candidates) if idx != best_index]
+        return [best] + remaining + candidates[len(top_candidates):]
+
+    return candidates
+
+
+def pdf_escape(text: str) -> str:
+    return text.replace("\\", "\\\\").replace("(", "\\(").replace(")", "\\)")
+
+
+def generate_fallback_datasheet_pdf(
+    out_path: str, brand: str, code: str, description: str
+) -> bool:
+    lines = [
+        "Generated Datasheet",
+        f"Brand: {brand or 'N/A'}",
+        f"Product Code: {code or 'N/A'}",
+    ]
+    if description:
+        lines.append("Description:")
+        for line in textwrap.wrap(description, width=80):
+            lines.append(f"  {line}")
+    lines.append(f"Generated: {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}")
+
+    content_lines = []
+    for line in lines:
+        content_lines.append(f"({pdf_escape(line)}) Tj")
+        content_lines.append("T*")
+    content_stream = "BT /F1 12 Tf 72 760 Td 14 TL\n" + "\n".join(content_lines) + "\nET\n"
+    content_bytes = content_stream.encode("utf-8")
+
+    objects = []
+    objects.append("1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n")
+    objects.append("2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n")
+    objects.append(
+        "3 0 obj\n"
+        "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] "
+        "/Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>\n"
+        "endobj\n"
+    )
+    objects.append("4 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>\nendobj\n")
+    objects.append(
+        f"5 0 obj\n<< /Length {len(content_bytes)} >>\nstream\n"
+        + content_bytes.decode("utf-8")
+        + "endstream\nendobj\n"
+    )
+
+    xref_positions = []
+    pdf_parts = ["%PDF-1.4\n"]
+    for obj in objects:
+        xref_positions.append(sum(len(part.encode("utf-8")) for part in pdf_parts))
+        pdf_parts.append(obj)
+
+    xref_start = sum(len(part.encode("utf-8")) for part in pdf_parts)
+    pdf_parts.append("xref\n0 6\n0000000000 65535 f \n")
+    for pos in xref_positions:
+        pdf_parts.append(f"{pos:010d} 00000 n \n")
+    pdf_parts.append(
+        "trailer\n<< /Size 6 /Root 1 0 R >>\nstartxref\n"
+        f"{xref_start}\n%%EOF\n"
+    )
+
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    try:
+        with open(out_path, "wb") as f:
+            f.write("".join(pdf_parts).encode("utf-8"))
+        return True
+    except Exception:
+        return False
 
 
 def load_products_excel(path: str, sheet_name):
@@ -364,6 +549,7 @@ def main():
     ok = 0
     skipped = 0
     failed = 0
+    generated = 0
 
     for idx, row in df.iterrows():
         brand = str(row.get(brand_col) or "").strip()
@@ -395,8 +581,11 @@ def main():
             print(f"  FAIL search: {e}")
             continue
 
+        candidates = ai_rank_candidates(candidates, brand, code, description)
+
         downloaded = False
-        for url in candidates:
+        for candidate in candidates:
+            url = candidate["url"]
             is_pdf = looks_like_pdf_url(url) or head_or_get_is_pdf(sess, url)
             if is_pdf:
                 print(f"  Trying: {url}")
@@ -425,8 +614,12 @@ def main():
                 continue
 
         if not downloaded:
-            failed += 1
-            print("  FAIL: no working PDF found")
+            if generate_fallback_datasheet_pdf(out_path, brand, code, description):
+                generated += 1
+                print(f"  GENERATED -> {out_path}")
+            else:
+                failed += 1
+                print("  FAIL: no working PDF found")
 
         time.sleep(random.uniform(*SLEEP_BETWEEN_PRODUCTS_SEC))
 
@@ -434,6 +627,7 @@ def main():
     print(f"Downloaded: {ok}")
     print(f"Skipped:    {skipped}")
     print(f"Failed:     {failed}")
+    print(f"Generated:  {generated}")
 
 
 if __name__ == "__main__":
