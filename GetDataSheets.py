@@ -25,7 +25,7 @@ except ImportError:  # pragma: no cover - fallback when ddgs isn't installed
 # =========================
 # CONFIG
 # =========================
-EXCEL_PATH = "products.xlsx"          # input Excel file path
+EXCEL_PATH = "/home/henrywoodrow/Documents/work_data/Untitled 1.xlsx"          # input Excel file path
 OUTPUT_DIR = "data sheets"            # where PDFs will be saved
 
 # IMPORTANT FIX:
